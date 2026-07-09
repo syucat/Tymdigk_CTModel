@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (see 20260708_INTRO/COMMANDS.md for setup)
+venv/
+.venv/
+
+# Dataset — large, publicly downloadable. See DATA_CELL/howToGet.md.
+/DATA_CELL/*
+!/DATA_CELL/howToGet.md
+
+# OS
+.DS_Store
+Thumbs.db

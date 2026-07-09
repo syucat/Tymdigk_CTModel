@@ -1,0 +1,30 @@
+# 20260708/ のスクリプト(main.py, track_and_visualize.py, build_viewer.py,
+# regen_3d_only.py, regen_area_and_filtered_3d.py)が実際にimportしているものだけに
+# 絞った最小構成です。プロジェクトルートのrequirements.txtにはcellpose・PyQt5・
+# segment-anythingなど他の実験(MAIN_3など)用の依存も大量に混ざっているので、
+# 20260708だけを動かすならこちらを使ってください。
+#
+# 動作確認済み環境: Python 3.10, CUDA 12.1 (NVIDIA GPU, VRAM 12GB)
+#
+# --- インストール手順 ---
+# 1) PyTorch (GPU版, CUDA 12.1) を先に単独でインストールする
+#    pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+#
+#    NVIDIA GPUが無い/CUDAバージョンが違う場合は上のコマンドを実行せず、
+#    以下の行の "--extra-index-url" ごと削除してCPU版を入れてください
+#    (その場合 main.py の学習はCPUで動きますが非常に遅くなります)。
+#
+# 2) 残りの依存を一括インストール
+#    pip install -r requirements.txt
+#
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.2.2+cu121
+torchvision==0.17.2+cu121
+torchaudio==2.2.2+cu121
+numpy==1.26.4
+tifffile==2025.5.10
+matplotlib==3.8.2
+opencv-python==4.9.0.80
+plotly==6.7.0
+scipy==1.15.3
