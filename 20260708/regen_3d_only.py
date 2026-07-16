@@ -35,13 +35,15 @@ def main():
             continue
         z_range = list(range(int(nonzero.min()), int(nonzero.max()) + 1))
 
-        binary_masks = []
+        contours_per_slice = []
+        shape = None
         for z in z_range:
             raw = tifffile.imread(raw_path(f), key=z)
-            binary, _ = predict_slice(model, raw, norm_lo, norm_hi, device)
-            binary_masks.append(binary)
+            shape = raw.shape
+            contours, _ = predict_slice(model, raw, norm_lo, norm_hi, device)
+            contours_per_slice.append(contours)
 
-        per_slice_tagged, _, _ = track_contours_across_z(binary_masks)
+        per_slice_tagged, _, _ = track_contours_across_z(contours_per_slice, shape)
 
         frame_dir = out_dir / f"t{f:03d}"
         render_3d_view(z_range, mask_volume, per_slice_tagged, frame_dir / "view3d.html", "../../plotly_bundle.js")

@@ -41,10 +41,16 @@ from plotly.subplots import make_subplots
 from scipy.optimize import linear_sum_assignment
 
 from main import (
-    RESULTS_DIR,
+    RESULTS_DIR, LABEL_SPEC, ANNOTATION_SUBDIR,
     build_frame_split, compute_norm_bounds, compute_abs_bounds,
     UNet, pad_to_multiple, raw_path, mask_path,
 )
+
+# "GT"(人手検証済み)か"ST"(Silver Truth、アルゴリズム生成の疑似正解)か。
+# Fluo-N3DH-CHO/Fluo-C3DL-MDA231は本物のGT/SEGが疎すぎるためSTを使っている
+# (main.py DATASET_CONFIGS参照)。パネルのタイトルにそのまま使い、「GT」と
+# 表示していたのが実際にはSTだった、という混同を今後の生成分から防ぐ。
+ANNOTATION_LABEL = ANNOTATION_SUBDIR
 
 IOU_MATCH_THRESHOLD = 0.1
 MIN_CONTOUR_AREA = 5
@@ -60,7 +66,7 @@ NOISE_AREA_THRESHOLD = 150
 
 
 def load_model(model_path, device):
-    model = UNet().to(device)
+    model = UNet(out_channels=LABEL_SPEC.out_channels, activation=LABEL_SPEC.activation).to(device)
     ckpt = torch.load(model_path, map_location=device)
     # 新形式({"model": state_dict, "optimizer": ..., ...})・旧形式(state_dictそのもの)の両方に対応
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -70,19 +76,15 @@ def load_model(model_path, device):
 
 
 def predict_slice(model, raw_slice, norm_lo, norm_hi, device):
-    """(二値マスク, sigmoid確率マップ)を返す"""
+    """(輪郭リスト, 表示用float map)を返す。実際の変換はLABEL_SPEC.to_contour_input
+    (main.py)がLABEL_MODEごとに行う(単純な2値化+findContours、またはwatershedなど。
+    詳細はPROJECT_labeling.md参照)。"""
     image = np.clip((raw_slice.astype(np.float32) - norm_lo) / (norm_hi - norm_lo), 0, 1)
     tensor = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).to(device)
     tensor_p, (h, w) = pad_to_multiple(tensor)
     with torch.no_grad():
         pred = model(tensor_p)[:, :, :h, :w]
-    prob = pred[0, 0].cpu().numpy()
-    return (prob > 0.5).astype(np.uint8), prob
-
-
-def get_contours(binary_mask):
-    contours, _ = cv2.findContours(binary_mask * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in contours if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
+    return LABEL_SPEC.to_contour_input(pred, image=image)
 
 
 def contour_mask(contour, shape):
@@ -97,21 +99,19 @@ def iou(mask_a, mask_b):
     return inter / union if union > 0 else 0.0
 
 
-def track_contours_across_z(binary_masks):
+def track_contours_across_z(contours_per_slice, shape):
     """
-    Zスライスごとの二値マスクのリストを受け取り、輪郭をZ間でコスト(1-IoU)ベースの
-    ハンガリアン法(scipy.optimize.linear_sum_assignment)で最適に1対1割り当てして
-    タグ(ID)を割り振る。戻り値: 各zごとの[(contour, tag_id), ...]、
+    Zスライスごとの輪郭リスト(predict_sliceで既に抽出済み)を受け取り、輪郭をZ間で
+    コスト(1-IoU)ベースのハンガリアン法(scipy.optimize.linear_sum_assignment)で
+    最適に1対1割り当てしてタグ(ID)を割り振る。戻り値: 各zごとの[(contour, tag_id), ...]、
     各zまでの累積ユニークタグ数のリスト、使われたタグの総数
     """
-    shape = binary_masks[0].shape
     active_tracks = {}  # tag_id -> 直前スライスでの輪郭マスク
     next_tag = 1
     per_slice_tagged = []
     cumulative_tags = []
 
-    for binary_mask in binary_masks:
-        contours = get_contours(binary_mask)
+    for contours in contours_per_slice:
         cur_masks = [contour_mask(c, shape) for c in contours]
         assigned = [None] * len(contours)
 
@@ -206,7 +206,7 @@ def render_area_histogram(tag_areas_before, tag_areas_after, gt_areas, threshold
         ax.bar(pred_lo, pred_counts, width=pred_hi - pred_lo, align="edge",
                color="#4a7dff", alpha=0.85, label=f"predicted tags (n={len(pred_vals)})")
         ax.bar(gt_lo, gt_counts, width=gt_hi - gt_lo, align="edge",
-               color="#ff9f40", alpha=0.85, label=f"GT instances (n={len(gt_vals)})")
+               color="#ff9f40", alpha=0.85, label=f"{ANNOTATION_LABEL} instances (n={len(gt_vals)})")
         ax.axvline(threshold, color="#ff4d4d", linestyle="--", linewidth=1.2,
                    label=f"noise threshold={threshold}")
         ax.set_ylabel("count", color="white", fontsize=9)
@@ -247,7 +247,14 @@ def tab20_color_rgb_str(tag_id):
 
 
 def render_slice_image(raw_slice, gt_mask_slice, prob_map, tagged_contours,
-                        abs_lo, abs_hi, norm_lo, norm_hi, out_path):
+                        abs_lo, abs_hi, norm_lo, norm_hi, out_path,
+                        output_title=None, output_cmap=None, output_vmax=None):
+    """output_title/cmap/vmaxを省略するとLABEL_SPEC(main.pyのLABEL_MODE)の値を使う
+    (既存呼び出しとの後方互換)。DWTのようにLABEL_SPECを持たないパイプラインは
+    ここを明示的に渡す(dwt_track_and_visualize.py参照)。"""
+    output_title = LABEL_SPEC.output_title if output_title is None else output_title
+    output_cmap = LABEL_SPEC.output_cmap if output_cmap is None else output_cmap
+    output_vmax = LABEL_SPEC.output_vmax if output_vmax is None else output_vmax
     shape = raw_slice.shape
     input_mono = np.clip((raw_slice.astype(np.float32) - abs_lo) / (abs_hi - abs_lo), 0, 1)
     input_bmod = np.clip((raw_slice.astype(np.float32) - norm_lo) / (norm_hi - norm_lo), 0, 1)
@@ -264,6 +271,24 @@ def render_slice_image(raw_slice, gt_mask_slice, prob_map, tagged_contours,
             cx, cy = int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"])
             cv2.putText(tagged_img, str(tag_id), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+    # GTマスク自体が持つインスタンスIDごとに輪郭を色分け+番号表示する(予測のtagged_imgと同じ描き方)。
+    # くっついて見える細胞が、実はGT上では別インスタンスとして区別されているのかどうかを
+    # 目で確認できるようにするための表示専用パネル(トラッキング処理には影響しない)。
+    gt_tagged_img = np.zeros((*shape, 3), dtype=np.uint8)
+    for inst_id in np.unique(gt_mask_slice):
+        if inst_id == 0:
+            continue
+        inst_id = int(inst_id)
+        binary = (gt_mask_slice == inst_id).astype(np.uint8)
+        contours, _ = cv2.findContours(binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        color = tab20_color_mpl(inst_id)
+        for c in contours:
+            cv2.drawContours(gt_tagged_img, [c], -1, color, 2)
+            m = cv2.moments(c)
+            if m["m00"] > 0:
+                cx, cy = int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"])
+                cv2.putText(gt_tagged_img, str(inst_id), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
     fig, axes = plt.subplots(2, 4, figsize=(17, 8.6))
     fig.patch.set_facecolor(DARK_BG)
 
@@ -271,18 +296,24 @@ def render_slice_image(raw_slice, gt_mask_slice, prob_map, tagged_contours,
         (axes[0, 0], raw_slice, "base", dict(cmap="gray")),
         (axes[0, 1], input_mono, "input", dict(cmap="gray", vmin=0, vmax=1)),
         (axes[0, 2], input_bmod, "input (brightness-modified)", dict(cmap="gray", vmin=0, vmax=1)),
-        (axes[0, 3], prob_map, "output (B:bg, W:cell)", dict(cmap="gray", vmin=0, vmax=1)),
+        (axes[0, 3], prob_map, output_title,
+         dict(cmap=output_cmap, vmin=0, vmax=output_vmax)),
         (axes[1, 0], contour_img, "contour", {}),
         (axes[1, 1], tagged_img, "tagged (C:IoU, Hungarian)", {}),
-        (axes[1, 2], (gt_mask_slice > 0).astype(np.uint8), f"GT mask ({n_gt})", dict(cmap="gray")),
+        (axes[1, 2], (gt_mask_slice > 0).astype(np.uint8), f"{ANNOTATION_LABEL} mask ({n_gt})", dict(cmap="gray")),
+        (axes[1, 3], gt_tagged_img, f"{ANNOTATION_LABEL} mask tagged by instance ID ({n_gt})", {}),
     ]
     for ax, data, title, kwargs in panels:
-        ax.imshow(data, **kwargs)
+        im = ax.imshow(data, **kwargs)
         ax.set_title(title, color="white", fontsize=11)
         ax.axis("off")
         ax.set_facecolor(DARK_BG)
-    axes[1, 3].axis("off")
-    axes[1, 3].set_facecolor(DARK_BG)
+        if ax is axes[0, 3]:
+            # 「output」パネルだけ、値→色の対応が分かるカラーバーを添える
+            # (distance_transformモードではpx単位の深さ、他モードでは0-1の確率)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.get_yticklabels(), color="white")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=100, facecolor=fig.get_facecolor())
@@ -310,7 +341,7 @@ def render_3d_view(z_range, mask_volume, per_slice_tagged, out_path, plotly_bund
                 gt_by_id.setdefault(int(inst_id), []).append((pts[:, 0], pts[:, 1], z))
 
     fig = make_subplots(rows=1, cols=2, specs=[[{"type": "scene"}, {"type": "scene"}]],
-                         subplot_titles=(pred_title, "GT instances (3D)"))
+                         subplot_titles=(pred_title, f"{ANNOTATION_LABEL} instances (3D)"))
 
     def add_traces(by_tag, col):
         for tag_id, segs in by_tag.items():
@@ -363,15 +394,16 @@ def process_frame(model, frame_idx, abs_lo, abs_hi, norm_lo, norm_hi, device, ou
     z_range = list(range(int(nonzero.min()), int(nonzero.max()) + 1))
     true_cell_ids = set(np.unique(mask_volume[z_range])) - {0}
 
-    raw_slices, binary_masks, prob_maps = [], [], []
+    raw_slices, contours_per_slice, prob_maps = [], [], []
     for z in z_range:
         raw = tifffile.imread(raw_path(frame_idx), key=z)
         raw_slices.append(raw)
-        binary, prob = predict_slice(model, raw, norm_lo, norm_hi, device)
-        binary_masks.append(binary)
+        contours, prob = predict_slice(model, raw, norm_lo, norm_hi, device)
+        contours_per_slice.append(contours)
         prob_maps.append(prob)
 
-    per_slice_tagged, cumulative_tags, total_tags = track_contours_across_z(binary_masks)
+    per_slice_tagged, cumulative_tags, total_tags = track_contours_across_z(
+        contours_per_slice, raw_slices[0].shape)
 
     frame_dir = out_dir / f"t{frame_idx:03d}"
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -415,6 +447,11 @@ def main():
     parser.add_argument("--model-path", required=True, help="読み込むモデルのパス(.pth)")
     parser.add_argument("--run-name", required=True, help="results/以下に作る実験フォルダ名")
     parser.add_argument("--description", required=True, help="この実験の説明(description.txtに書く)")
+    parser.add_argument("--model-label", required=True,
+                         help="ビューアの1段階目(学習/モデル)の表示名。同じLABEL_MODEでも"
+                              "チェックポイントが違えば別モデル扱いになるため、自動導出はせず毎回指定する")
+    parser.add_argument("--contour-label", required=True,
+                         help="ビューアの2段階目(輪郭の作り方)の表示名(例: watershed, distance_flowなど)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -439,7 +476,11 @@ def main():
             print(f"  GT={result['nGtTotal']} pred={result['nPredTotal']} "
                   f"pred_filtered={result['nPredFiltered']} slices={len(result['slices'])}")
 
-    manifest = {"run_name": args.run_name, "description": args.description, "frames": frames_meta}
+    manifest = {
+        "run_name": args.run_name, "description": args.description,
+        "model_label": args.model_label, "contour_label": args.contour_label,
+        "frames": frames_meta,
+    }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     (out_dir / "description.txt").write_text(args.description, encoding="utf-8")
     print(f"saved: {out_dir}/manifest.json ({len(frames_meta)} frames)")
